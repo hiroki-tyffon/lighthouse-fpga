@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
+# 必要なライブラリをインポート
 import serial
 import math
 
-
+# 方位角と仰角を計算する関数
 def calculateAE(firstBeam, secondBeam):
     azimuth = ((firstBeam + secondBeam) / 2) - math.pi
     p = math.radians(60)
@@ -11,13 +12,15 @@ def calculateAE(firstBeam, secondBeam):
     elevation = math.atan(math.sin(beta/2)/math.tan(p/2))
     return (azimuth, elevation)
 
+# タイムスタンプを減算する関数
 def ts_sub(a, b):
     return (a - b) & 0x00ffffff
 
+# タイムスタンプを加算する関数
 def ts_add(a, b):
     return (a + b) & 0x00ffffff
 
-
+# ライトハウス基地局からの周期時間は48 MHzのクロックで表現され、24 MHzを使用するため、2で割る。
 # The cycle times from the Lighhouse base stations is expressed in a 48 MHz clock, we use 24 MHz, hence the / 2.
 PERIODS = [959000 / 2, 957000 / 2,
            953000 / 2, 949000 / 2,
@@ -28,6 +31,7 @@ PERIODS = [959000 / 2, 957000 / 2,
            907000 / 2, 901000 / 2,
            893000 / 2, 887000 / 2]
 
+# スイープデータを保持するクラス
 class SweepData:
     def __init__(self, ts, width, offset, channel, slow_bit):
         self.ts = ts
@@ -36,6 +40,7 @@ class SweepData:
         self.channel = channel
         self.slow_bit = slow_bit
 
+    # スイープデータを出力する関数
     def dump(self, sensor_nr, mark=False):
         if self.channel == None:
             chan_s = ' -'
@@ -53,7 +58,7 @@ class SweepData:
 
         print("Sensor:{}  TS:{:06x}  Width:{:4}  Chan:{}({})  offset:{:-6d}  {}".format(sensor_nr, self.ts, self.width, chan_s, slow_s, self.offset, mark_s))
 
-
+# スイープデータのブロックを保持するクラス
 class SweepBlock:
     def __init__(self):
         self.sensors = [None, None, None, None]
@@ -63,25 +68,30 @@ class SweepBlock:
         self.offset_sensor = None
         self.slow_bit = None
 
+    # エラーメッセージを出力する関数
     def print_err(self, s):
         # Enable this print to see why a frame is discarded
         # print(s)
         # self.dump()
         pass
 
+    # センサーのデータをブロックに追加する関数
     def push(self, sensor, ts, width, offset, channel, slow_bit):
         if self.sensors[sensor] != None:
             return False
         self.sensors[sensor] = SweepData(ts, width, offset, channel, slow_bit)
         return True
 
+    # データブロックを処理する関数
     def process(self):
+        # すべてのセンサーにデータがあることを確認
         # Check we have data for all sensors
         for sensor in self.sensors:
             if not sensor:
                 self.print_err("Sensor missing - discard sweep")
                 return False
 
+        # チャンネル。すべて同じでなければならないが、一つだけNoneであることが許される
         # Channel. Should all be the same except one that is None
         channel_count = 0
         for sensor in self.sensors:
@@ -100,11 +110,13 @@ class SweepBlock:
             self.print_err("Channel missing - discard sweep")
             return False
 
+        # すべてのセンサーにチャンネルを設定
         # Set channel in all sensors
         for sensor in self.sensors:
             sensor.channel = self.channel
             sensor.slow_bit = self.slow_bit
 
+        # オフセット。一つだけのセンサーにオフセットがあるべき
         # offset. Should be offset on one and only one sensor
         self.offset_sensor = None
         for sensor in self.sensors:
@@ -148,13 +160,16 @@ class SweepBlock:
 
 
 class Angles:
+    # 初期化メソッド
     def __init__(self, channel):
         self.data = [None, None, None, None]
         self.channel = channel
 
+    # センサー、方位角、仰角を設定するメソッド
     def set(self, sensor, azimuth, elevation):
         self.data[sensor] = (azimuth, elevation)
 
+    # データを出力するメソッド
     def dump(self):
         sensor_nr = 0
         for d in self.data:
@@ -163,10 +178,12 @@ class Angles:
 
 
 class BaseStation:
+    # 初期化メソッド
     def __init__(self, channel):
         self.channel = channel
         self.prev_block = None
 
+    # ブロックをプッシュするメソッド
     def push(self, block):
         result = None
 
@@ -186,6 +203,7 @@ class BaseStation:
 
         return result
 
+    # 二回目のスイープかどうかを判断するメソッド
     def is_second_sweep(self, a, b):
         if a.sensors[0].offset > b.sensors[0].offset:
             return False
@@ -197,6 +215,8 @@ class BaseStation:
 
         return True
 
+    # プロセスを実行するメソッド
+    # ここで、方位角と仰角を計算する
     def process(self, a, b):
         # a.dump()
         # b.dump()
@@ -208,6 +228,7 @@ class BaseStation:
             offset1 = b.sensors[i].offset
             period = PERIODS[self.channel]
 
+            # 
             firstBeam = (offset0 / period) * 2 * math.pi
             secondBeam = (offset1 / period) * 2 * math.pi
             azimuth, elevation = calculateAE(firstBeam, secondBeam)
@@ -217,21 +238,29 @@ class BaseStation:
         return result
 
 class PulseProcessor:
+    # 初期化メソッド
     def __init__(self):
         self.block = None
         self.latest_pulse = 0
 
+    # プッシュするメソッド
+    # センサーデータをプッシュするメソッド
     def push(self, sensor, ts, width, offset, channel, slow_bit):
+        # 結果を初期化
         result = None
 
+        # 最新のパルスとの時間差を計算
         delta = ts_sub(ts, self.latest_pulse)
         if delta > 10000:
             if self.block:
                 if self.block.process():
                     result = self.block
+                # ブロックをリセット
                 self.block = None
+        # 最新のパルスを更新
         self.latest_pulse = ts
 
+        # ブロックが存在しない場合、新たにSweepBlockを作成
         if not self.block:
             self.block = SweepBlock()
 
@@ -283,6 +312,8 @@ if __name__ == "__main__":
 
         # Offset is expressed in a 6 MHz clock, while the timestamp uses a 24 MHz clock.
         # update offset to a 24 MHz clock
+        # オフセットは 6 MHz クロックで表現されますが、タイムスタンプは 24 MHz クロックを使用します。
+        # オフセットを 24 MHz クロックに更新します
         offset = offset_6 * 4
 
         sensor = first_word & 0x03

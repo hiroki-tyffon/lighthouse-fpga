@@ -44,8 +44,9 @@ case class IdentPulseWithData() extends Bundle {
 
 class PulseIdentifier extends Component {
     val io = new Bundle {
+        // slave: データを受け取る方向であることを示す
         val pulseIn = slave Stream(PulseWithData())
-
+        // master: データを送る方向であることを示す
         val pulseOut = master Stream(IdentPulseWithData())
     }
 
