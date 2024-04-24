@@ -34,6 +34,10 @@ case class Pulse(timestampWidth: BitCount = 24 bits, widthWidth: BitCount = 16 b
   val timestamp = UInt(timestampWidth)
 }
 
+// io.timeには、クロック
+// io.eには、センサーの値
+// 立下りをみて、timestampがリセット
+// 立ち上がりをみて時間の長さがwidthに値が書き込まれる
 class PulseTimer extends Component {
   val io = new Bundle {
     val time = in UInt(24 bits)

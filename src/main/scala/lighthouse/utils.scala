@@ -54,6 +54,7 @@ class ShiftCounter(size: Int) extends Area {
     def increment(i: Int = 1) = sr := sr.rotateLeft(i)
 }
 
+// おそらく2つの信号を受け取り、それらのエッジを検出するためのモジュール
 case class Ddr() extends Bundle {
     val v = Vec(Bool, 2)
 
