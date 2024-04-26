@@ -3,7 +3,7 @@
  * |  ,-^-,  |      / __ )(_) /_______________ _____  ___
  * | (  O  ) |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
  * | / ,--´  |    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
- *    +------`   /_____/_/\__/\___/_/   \__,_/ /___/\___/
+ * +------`   /_____/_/\__/\___/_/   \__,_/ /___/\___/
  *
  * Lighhouse deck FPGA
  *
@@ -40,83 +40,85 @@ import lighthouse.constants
 //      その状態がtargetStateと一致し、カウンタ条件を満たす場合、対応するビットがfoundレジスタでtrueに設定され、searching状態がfalseに設定されます。
 // 3. foundがtrueになった場合、見つかった多項式のインデックスがpolyFound出力に割り当てられます。
 // 4. doneイベントは、検索が終了した（searchingがfalseになった）ときに発生します。
-//      このクラスは、そのタップ構成（LFSR）で表される複数の多項式に対して並列検索を行うハードウェアコンポーネントを実装しています。
-//      コンポーネントは初期状態と目標状態を入力とし、指定された反復回数内で目標状態を生成する多項式のLFSRを検索します。
-//      見つかった多項式のインデックスやその他のステータス信号が出力として提供されます。
+//      
+// このクラスは、そのタップ構成（LFSR）で表される複数の多項式に対して並列検索を行うハードウェアコンポーネントを実装しています。
+// コンポーネントは初期状態と目標状態を入力とし、指定された反復回数内で目標状態を生成する多項式のLFSRを検索します。
+// 見つかった多項式のインデックスやその他のステータス信号が出力として提供されます。
 
 class PolyFinder extends Component {
 
-    // 選択範囲の開始
-    val io = new Bundle {
-        // 開始状態、目標状態、最大ティック数を入力として定義します
-        val startState = in Bits(17 bits)
-        val targetState = in Bits(17 bits)
-        val maxTick = in UInt(10 bits)
+  // 選択範囲の開始
+  val io = new Bundle {
+    // 開始状態、目標状態、最大ティック数を入力として定義します
+    val startState = in Bits (17 bits)
+    val targetState = in Bits (17 bits)
+    val maxTick = in UInt (10 bits)
 
-        // スタートイベントを定義します
-        val start = slave Event
+    // スタートイベントを定義します
+    val start = slave Event
 
-        // 見つかった多項式、そのインデックス、完了イベントを出力として定義します
-        val found = out Bool
-        val polyFound = out UInt(5 bits)
-        val done = master Event
+    // 見つかった多項式、そのインデックス、完了イベントを出力として定義します
+    val found = out Bool
+    val polyFound = out UInt (5 bits)
+    val done = master Event
+  }
+
+  // 検索中かどうかを示すフラグと、見つかった多項式を保存するレジスタを定義します
+  val searching = RegInit(False)
+  val found = RegInit(B(0, constants.Polys.length bits))
+
+  // 出力を設定します
+  io.polyFound := OHToUInt(found)
+  io.done.valid := searching.fall()
+  // foundはビットベクトルで、各ビットは特定の多項式が見つかったかどうかを示しています。
+  // したがって、found.orRは、いずれかの多項式が見つかった場合にtrueを返します。
+  io.found := found.orR
+  io.start.ready := True
+
+  // カウンタを定義し、検索中にデクリメントします
+  val counter = RegInit(U(0, io.maxTick.getBitsWidth bits))
+  when(searching) {
+    counter := counter - 1
+
+    // カウンタが0になったら、検索を終了します
+    when(counter === 0) {
+      searching := False
+      found := 0
+    }
+  }.otherwise {
+    counter := io.maxTick
+  }
+
+  // スタートイベントが発生したら、検索を開始します
+  when(io.start.fire) {
+    searching := True
+    found := 0
+  }
+
+  // 各多項式の状態を保存するベクタを定義します
+  val states = Vec(Bits(17 bits), constants.Polys.length)
+
+  // 各多項式に対して処理を行います
+  for (i <- 0 to constants.Polys.length - 1) {
+    val lfsr = new Lfsr(constants.Polys(i), 17)
+    states(i) := lfsr.state
+
+    // スタートイベントが発生したら、LFSRの状態を開始状態で初期化します
+    when(io.start.fire) {
+      lfsr.state := io.startState
     }
 
-    // 検索中かどうかを示すフラグと、見つかった多項式を保存するレジスタを定義します
-    val searching = RegInit(False)
-    val found = RegInit(B(0, constants.Polys.length bits))
+    // 検索中は、LFSRを反復し、その状態が目標状態と一致するかどうかを確認します
+    when(searching) {
+      lfsr.iterate()
 
-    // 出力を設定します
-    io.polyFound := OHToUInt(found)
-    io.done.valid := searching.fall()
-    io.found := found.orR
-    io.start.ready := True
-
-    // カウンタを定義し、検索中にデクリメントします
-    val counter = RegInit(U(0, io.maxTick.getBitsWidth bits))
-    when (searching) {
-        counter := counter - 1
-
-        // カウンタが0になったら、検索を終了します
-        when (counter === 0) {
-            searching := False
-            found := 0
-        }
-    }.otherwise {
-        counter := io.maxTick
+      // 状態が目標状態と一致したら、その多項式を見つけたとして、検索を終了します
+      when((counter(2 to counter.getBitsWidth - 1) === 0) && (lfsr.state === io.targetState)) {
+        found(i) := True
+        searching := False
+      }
     }
-
-    // スタートイベントが発生したら、検索を開始します
-    when (io.start.fire) {
-        searching := True
-        found := 0
-    }
-
-    // 各多項式の状態を保存するベクタを定義します
-    val states = Vec(Bits(17 bits), constants.Polys.length)
-
-    // 各多項式に対して処理を行います
-    for (i <- 0 to constants.Polys.length - 1) {
-        val lfsr = new Lfsr(constants.Polys(i), 17)
-        states(i) := lfsr.state
-
-        // スタートイベントが発生したら、LFSRの状態を開始状態で初期化します
-        when (io.start.fire) {
-            lfsr.state := io.startState
-        }
-
-        // 検索中は、LFSRを反復し、その状態が目標状態と一致するかどうかを確認します
-        when (searching) {
-            lfsr.iterate()
-
-            // 状態が目標状態と一致したら、その多項式を見つけたとして、検索を終了します
-            when ((counter(2 to counter.getBitsWidth-1) === 0) && (lfsr.state === io.targetState)) {
-                found(i) := True
-                searching := False
-            }
-        }
-    }
-    // 選択範囲の終了
+  }
 }
 
 
@@ -126,24 +128,24 @@ import spinal.core.sim._
 object PolyFinderSim {
   def main(args: Array[String]): Unit = {
     SimConfig.allOptimisation
-            .addSimulatorFlag("-I../../sim_rtl")
-            .withWave
-            .compile (new PolyFinder).doSim{ dut =>
-      dut.clockDomain.forkStimulus(10)
+      .addSimulatorFlag("-I../../sim_rtl")
+      .withWave
+      .compile(new PolyFinder).doSim { dut =>
+        dut.clockDomain.forkStimulus(10)
 
-      dut.io.startState #= 0x1fe72
-      dut.io.targetState #= 0x0bd25
-      dut.io.maxTick #= 183
-      dut.io.start.valid #= false
+        dut.io.startState #= 0x1fe72
+        dut.io.targetState #= 0x0bd25
+        dut.io.maxTick #= 183
+        dut.io.start.valid #= false
 
-      dut.clockDomain.waitRisingEdge()
-      dut.io.start.valid #= true
-      dut.clockDomain.waitRisingEdge()
-      dut.io.start.valid #= false
+        dut.clockDomain.waitRisingEdge()
+        dut.io.start.valid #= true
+        dut.clockDomain.waitRisingEdge()
+        dut.io.start.valid #= false
 
-      dut.clockDomain.waitRisingEdge(200)
+        dut.clockDomain.waitRisingEdge(200)
 
-      simSuccess()
-    }
+        simSuccess()
+      }
   }
 }
