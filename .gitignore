@@ -13,3 +13,5 @@ LighthouseTopLevel.v
 verbose.log
 tmp/
 *.bin
+.idea
+.bsp

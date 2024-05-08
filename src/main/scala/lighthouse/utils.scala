@@ -54,6 +54,7 @@ class ShiftCounter(size: Int) extends Area {
     def increment(i: Int = 1) = sr := sr.rotateLeft(i)
 }
 
+// おそらく2つの信号を受け取り、それらのエッジを検出するためのモジュール
 case class Ddr() extends Bundle {
     val v = Vec(Bool, 2)
 
@@ -64,15 +65,25 @@ case class Ddr() extends Bundle {
     }
 }
 
+// ビット幅（width）を指定したシフトレジスタの実装を提供します。
+// このクラスは、データの一時的な保存とシフト操作（新しいデータの追加と古いデータの削除）を行います。
+// このクラスは、新しいデータが入力ストリームに到着すると、
+// それをバッファの最下位ビットに追加し、最上位ビットを削除します（シフト操作）。
+// バッファが満杯でない場合、またはデータが読み出された場合にのみ、新しいデータが追加されます。
+// また、出力ストリームがデータを要求したとき、またはリセット信号が受信されたときに、バッファの内容がリセットされます。
 class ShiftBuffer(width: Int) extends Component {
     val io = new Bundle {
+        // 外部からのデータ入力ストリームを受け取ります。これはslaveとして定義されているため、外部から制御されます。
         val dataIn = slave Stream(Bool)
+        // 内部のデータを外部に出力するストリームを提供します。これはmasterとして定義されているため、このクラスが制御します。
         val dataOut = master Stream(Bits(width bits))
 
+        // 外部からの信号でバッファをリセットします。
         val resetBuffer = in Bool
     }
 
     val buffer = Reg(Bits(width+1 bits)) init 1
+    // バッファが満杯である（最上位ビットがセットされている）ことを示すフラグです。
     val stalled = Bool
     val read = RegInit(False)
 
@@ -100,6 +111,9 @@ class Lfsr(poly: Int, length: Int) extends Area {
     def :=(newState: Bits) = this.state := newState
     def apply: Bits = this.state
 
+    // レジスタの状態を更新するメソッドです。
+    // 現在の状態と多項式（poly）のビットごとのANDを取り、その結果のビットごとのXORを計算します。
+    // その結果を新しいビットとしてレジスタの左端に追加し、右端のビットを削除します。
     def iterate() = {
         val b = (state & poly).xorR
         state := state(0 to length-2) ## b.asBits
@@ -107,6 +121,14 @@ class Lfsr(poly: Int, length: Int) extends Area {
 }
 
 // Useful system constants
+
+// 特定の多項式を検索し、それらの状態遷移を追跡するための基本的なパラメータとして機能します。
+
+// PolyFinderクラスでは、constants.Polysの各多項式に対して処理を行い、その状態が目標状態と一致するかどうかを確認します。
+// 状態が目標状態と一致した場合、その多項式が見つかったとして、検索を終了します。
+
+// OffsetFinderクラスでは、constants.Polysの各多項式に対して、特定のオフセットでのLFSRの状態を計算し、それをメモリに保存します。
+// これは、特定のオフセットでの多項式の状態を高速に取得するための準備ステップとなります。
 object constants {
   val Polys = Seq(0x0001D258, 0x00017E04,
                   0x0001FF6B, 0x00013F67,

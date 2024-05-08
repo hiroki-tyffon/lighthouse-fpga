@@ -3,7 +3,7 @@
  * |  ,-^-,  |      / __ )(_) /_______________ _____  ___
  * | (  O  ) |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
  * | / ,--´  |    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
- *    +------`   /_____/_/\__/\___/_/   \__,_/ /___/\___/
+ * +------`   /_____/_/\__/\___/_/   \__,_/ /___/\___/
  *
  * Lighhouse deck FPGA
  *
@@ -94,6 +94,16 @@ class LighthouseTopLevel(nSensors: Int = 4,
     slowClockDomain.clock := slowClk
   }
 
+  // Area clocked at 48MHzとArea clocked at 24MHzの間で、以下のようなデータのやりとり（共有）が行われています：
+  // 入力/出力（E / D）：
+  // 各エリアでは、EおよびDという名前のベクトルが、
+  // センサから読み込むための入力として、およびセンサに書き込むための出力として使用されます。 
+  // これらのベクトルは、48MHzエリアで読み込まれ、24MHzエリアで書き込まれます。
+  // 
+  // ビームワード：
+  // 48MHzエリアでセンサから読み取られたデータは、ビームワードと呼ばれる構造体にパッケージ化されます。
+  // このビームワードは、24MHzのエリアでさらに処理され、パルスとともにシングルストリームにパッケージ化されます。
+
   // Sensors IO wires.
   // The IO cells is clocked in the fast clock domain
   // the output wires, *_out and *_oe, are driven by the slow clock domain
@@ -105,6 +115,18 @@ class LighthouseTopLevel(nSensors: Int = 4,
   val d_oe = Vec(Bool, nSensors)
 
   // Area clocked at 48MHz
+  //  この領域では、beamWordsスタートリームを作成し、各センサに対して特定の動作を行います：
+  //  入力/出力（IO）としてSB_IOデバイス（おそらく独自の入出力デバイス）を使用してデータを読み書きします。
+  //  
+  //  Ddrオブジェクト内にD_IN_0フィールドから値を取得します。
+  //  （データはDDR（Double Data Rate）モードで転送される（一つのクロックサイクルに2ビットのデータを転送する方式）と思われます。）
+  //  
+  //  データをBMCデコード器に送り、脈動と位相を分析します
+  //  （これは光パルスをデータに変換するプロセスと思われます）。
+  //  
+  //  具体的な処理方法はuseDdrDecoderオプションによります。
+  //  このオプションがtrueの場合はDdrBmcDecoderを使用し、falseの場合はBmcDecoderを使用します。
+  //  デコードされたデータはShiftBufferへ送られ、データビームの一部としてストリーム化されます。
   val core = new ClockingArea(clkCtrl.coreClockDomain) {
 
     val beamWords = Vec(Stream(Bits(17 bits)), nSensors)
@@ -120,6 +142,7 @@ class LighthouseTopLevel(nSensors: Int = 4,
       ioE.CLOCK_ENABLE := True
       ioE.PACKAGE_PIN := io.e(sensor)
       e(sensor) := ioE.D_IN_0
+
       val ioD = SB_IO.ddrRegistredInout
       ioD.INPUT_CLK := clockDomain.clock
       ioD.OUTPUT_CLK := clockDomain.clock
@@ -156,9 +179,13 @@ class LighthouseTopLevel(nSensors: Int = 4,
   }
 
   // Area clocked at 24MHz
+  // この領域の主な目的は、センサデータの取得と処理、そしてそのデータを専用のストリームにパッケージ化することです。以下は、この領域で行われる主なステップです：
+  // - IDマップされたビームワードの生成：各センサに対して、「Sensor Configurator」と「Pulse Timer and Data Acquisition」の２つの主要な操作が行われます。
   val slowArea = new ClockingArea(slowClkCtrl.slowClockDomain) {
     // Global time
-    val time = Reg(UInt(24 bits)) init 0
+    // グローバルタイム：この部分では、グローバルな時間カウンタが定義されています。
+    // それは24ビットの無符号整数（UInt）として表され、初期値はゼロで、各クロックサイクルで1ずつ増加します。
+    val time = Reg(UInt(24 bits)) init 0 // Regと定義された値は、クロックサイクルに同期する
     time := time + 1
 
     val idBeamWords = Vec(Stream(PulseWithData()), nSensors)
@@ -166,6 +193,7 @@ class LighthouseTopLevel(nSensors: Int = 4,
     for (sensor <- 0 until nSensors) {
 
       // Sensor configurator
+      // 'Sensor Configurator'はセンサが適切に動作するように設定を調整します。
       val configurator = new ts4231Configurator
       configurator.io.reconfigure := RegNext(True, init = False) // Generates a rising edge at startup
       configurator.io.d_in := BufferCC(d(sensor))
@@ -176,11 +204,16 @@ class LighthouseTopLevel(nSensors: Int = 4,
       e_oe(sensor) := configurator.io.e_oe
 
       // Pulse timer and data acquisition
+      // 'Pulse Timer and Data Acquisition'はセンサからのパルスデータ（センサが物体を感知するために使用する光パルス）を取得し、そのデータをビームワード（パルスデータの集合）に変換します。
       val pulseTimer = new PulseTimer
       pulseTimer.io.time := time
+      // BufferCC関数はクロッククロッシングバッファと呼ばれるもので、異なるクロックドメイン間の信号の安全な伝送を担当します
       pulseTimer.io.e := BufferCC(e(sensor))
 
       // Store the beamWord in a register when it has been acquired
+      // ビームストリームの生成：
+      // 上記ステップで取得したデータは最終的に単一のビームストリームに結合されます。
+      // このストリームは、処理がブロックされるのを防ぐためにキューを介して管理されます。
       val beamWordStream = StreamCCByToggle(core.beamWords(sensor), clkCtrl.coreClockDomain, slowClkCtrl.slowClockDomain)
       val beamWord = Reg(beamWordStream.payload.clone())
       beamWordStream.ready := True
@@ -189,6 +222,7 @@ class LighthouseTopLevel(nSensors: Int = 4,
       }
 
       // Pack pulse timing and beamWord in a single stream at the end of the pulse
+      // パルスタイミングとビームワードをパルスの終わりで単一のストリームにパックします。
       val pulseWithData = PulseWithData()
       pulseWithData.id := sensor
       pulseWithData.pulse := pulseTimer.io.pulse
@@ -199,7 +233,11 @@ class LighthouseTopLevel(nSensors: Int = 4,
       // 0 is an invalid beam data (not possible to produce by LFSR)
       // This ensure that the pulse will report an invalid beamWord if
       // no data or not enough bits has been received
-      when (idBeamWord.fire) {
+      // このビームが処理されたら、ビームワードを0にリセットする。
+      // 0は無効なビームデータ（LFSRでは生成できない）。
+      // 以下の場合、パルスは無効な beamWord を報告します。
+      // データがない、または十分なビットが受信されていない場合
+      when(idBeamWord.fire) {
         beamWord := 0
       }
 
@@ -208,6 +246,8 @@ class LighthouseTopLevel(nSensors: Int = 4,
 
     // Create the combined beam stream.
     // The queue ensure that the pulse measurement is not blocked
+    // 結合されたビーム ストリームを作成します。
+    // キューによりパルス測定がブロックされないことが保証されます
     val beamsStream = StreamArbiterFactory.on(idBeamWords).queue(128)
 
     // Pulse identifier
@@ -221,11 +261,34 @@ class LighthouseTopLevel(nSensors: Int = 4,
     val finalStream = pulseOffsetFinder.io.pulseOut
 
     // Pack data, fields are aligned on bytes boundary as much as possible
-    val identifiedBeamStream =  finalStream.translateWith(
+    // データをパックし、フィールドは可能な限りバイト境界に揃えられます
+    //   0                   1                   2       
+    //   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 
+    //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //  |SID|   nPoly   |          Width                |
+    //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //  |          Sync Offset            |0 0 0 0 0 0 0|
+    //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //  |          Beam Word              |0 0 0 0 0 0 0|
+    //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //  |                 Timestamp                     |
+    //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // SID：センサーID、パルスを受信したセンサー
+    // Width: 24MHzクロックにおけるパルスの16ビット幅。
+    // nPoly: パルスの多項式。
+    // 同期オフセット：0でない場合、ベースステーションの同期イベントとこのパルスのオフセット。それ以外はオフセットなし。
+    // ビーム・ワード（Beam Word）：ビームで受信された生の17ビット・データ。
+    // タイムスタンプ：受信機の24MHzクロックで24ビットのタイムスタンプ。すべてのセンサーは同じクロックを共有する。
+    // 
+    // nPolyに関するメモ：
+    // nPoly は、最上位ビットが 0 であれば有効であり、(nPoly & 0x20) == 0 でなければ、このパルスに対して多項式は検出されない。
+    // 基地局のチャンネルは (nPoly / 2) + 1 であり、チャンネルは 1～16 である。チャネルは基地局設定においてモードとも呼ばれる。
+    // 各 V2 基地局は 2 つの多項式を使用して、毎ターン（つまり 2 回の受信スイープ毎）に 1 ビットの「スローデータ」をエンコードする。スロービットは nPoly & 0x01 である。
+    val identifiedBeamStream = finalStream.translateWith(
       pulseOffsetFinder.io.pulseOut.payload.pulse.timestamp ## // 24 Bits
-      B(0, 7 bits) ## finalStream.payload.beamWord ## // 24 Bits
-      B(0, 7 bits) ## finalStream.payload.offset ## // 24 Bits
-      finalStream.payload.pulse.width ## finalStream.payload.npoly ## finalStream.payload.id // 24 Bits
+        B(0, 7 bits) ## finalStream.payload.beamWord ## // 24 Bits
+        B(0, 7 bits) ## finalStream.payload.offset ## // 24 Bits
+        finalStream.payload.pulse.width ## finalStream.payload.npoly ## finalStream.payload.id // 24 Bits
     )
 
     // Generate syncrhonization frame (all ones) at regular interval
@@ -233,21 +296,29 @@ class LighthouseTopLevel(nSensors: Int = 4,
     syncStream.payload.assignFromBits(Bits(identifiedBeamStream.payload.getBitsWidth bits).setAll())
     val syncTimeout = Timeout(2 Hz)
     syncStream.valid := syncTimeout
-    when (syncTimeout) {
+    when(syncTimeout) {
       syncTimeout.clear()
     }
 
+
+    // データがUARTに出力される部分
+    // まず UartCtrl オブジェクトを作成し、設定しています。その後、syncBeamStream というストリームを使用します。
+    // これは、センサデータがパルスデータとマージされ、最終的に1つのストリームとしてパッケージ化される場所です。
     // Combine synchronization and beams, synchronzation has higher priotity (lower first)
     val syncBeamStream = StreamArbiterFactory.lowerFirst.onArgs(syncStream.stage(), identifiedBeamStream.stage())
 
     // Push datas in the UART converting form the measurement to bytes
+    // UART にデータをプッシュし、測定値をバイトに変換します
     val uartCtrl = new UartCtrl()
     uartCtrl.io.config.setClockDivider(uartBaudrate)
-    uartCtrl.io.config.frame.dataLength := 7  //8 bits
+    uartCtrl.io.config.frame.dataLength := 7 //8 bits
     uartCtrl.io.config.frame.parity := UartParityType.NONE
     uartCtrl.io.config.frame.stop := UartStopType.ONE
     uartCtrl.io.uart <> io.uart
-    StreamWidthAdapter(syncBeamStream.queue(128), uartCtrl.io.write, endianness=LITTLE)
+    // ここでの StreamWidthAdapter は、EMAのバス幅をUARTが扱えるバイト単位に変換するための関数呼び出しであり、これによりデータ処理は最終化され、外部のUARTデバイスに対して送信可能な信号になります。
+    // そして、その架橋を行い、UARTコントローラの書き込みインターフェースに接続（uartCtrl.io.write）します。
+    // これにより、処理されたデータはUARTを通じて外部に送信されることになります。
+    StreamWidthAdapter(syncBeamStream.queue(128), uartCtrl.io.write, endianness = LITTLE)
 
     // UART command handler
     val commandHandler = new CommandHandler
@@ -297,12 +368,13 @@ class LighthouseTopLevel(nSensors: Int = 4,
 object GenerateTopLevel {
   def main(args: Array[String]) {
     val report = SpinalConfig()
-                             .generateVerilog(new LighthouseTopLevel)
+      .generateVerilog(new LighthouseTopLevel)
     report.mergeRTLSource("blackboxes")
   }
 }
 
 //Top level simulation
+
 import spinal.sim._
 import spinal.core.sim._
 
@@ -310,45 +382,45 @@ object TopLevelSim {
   def main(args: Array[String]): Unit = {
 
     SimConfig.allOptimisation
-            .addSimulatorFlag("-Wno-PINMISSING -I../../sim_rtl")
-            .withWave
-            .compile {
-      val top = new LighthouseTopLevel
+      .addSimulatorFlag("-Wno-PINMISSING -I../../sim_rtl")
+      .withWave
+      .compile {
+        val top = new LighthouseTopLevel
 
-      top.clkCtrl.coreClockDomain.clock.simPublic()
+        top.clkCtrl.coreClockDomain.clock.simPublic()
 
-      top
-    }.doSim{ dut =>
-      dut.clkCtrl.coreClockDomain.forkStimulus(10)
+        top
+      }.doSim { dut =>
+        dut.clkCtrl.coreClockDomain.forkStimulus(10)
 
-      dut.io.d(0) #= false
-      sleep(300)
+        dut.io.d(0) #= false
+        sleep(300)
 
-      for (_ <- 0 to 5) {
-        for (_ <- 0 to 8) {
-          dut.clkCtrl.coreClockDomain.waitEdge(1)
-          dut.io.d(0) #= true
+        for (_ <- 0 to 5) {
+          for (_ <- 0 to 8) {
+            dut.clkCtrl.coreClockDomain.waitEdge(1)
+            dut.io.d(0) #= true
+          }
+          dut.clkCtrl.coreClockDomain.waitRisingEdge(4)
+
+          for (_ <- 0 to 8) {
+            dut.clkCtrl.coreClockDomain.waitEdge(1)
+            dut.io.d(0) #= true
+          }
+          dut.clkCtrl.coreClockDomain.waitRisingEdge(4)
+
+          for (_ <- 0 to 16) {
+            dut.clkCtrl.coreClockDomain.waitEdge(1)
+            dut.io.d(0) #= true
+          }
+
+          dut.clkCtrl.coreClockDomain.waitRisingEdge(8)
         }
-        dut.clkCtrl.coreClockDomain.waitRisingEdge(4)
 
-        for (_ <- 0 to 8) {
-          dut.clkCtrl.coreClockDomain.waitEdge(1)
-          dut.io.d(0) #= true
-        }
-        dut.clkCtrl.coreClockDomain.waitRisingEdge(4)
+        sleep((10 * 24000000) / 10)
 
-        for (_ <- 0 to 16) {
-          dut.clkCtrl.coreClockDomain.waitEdge(1)
-          dut.io.d(0) #= true
-        }
-
-        dut.clkCtrl.coreClockDomain.waitRisingEdge(8)
+        simSuccess()
       }
-
-      sleep((10*24000000) / 10)
-
-      simSuccess()
-    }
   }
 }
 
@@ -370,7 +442,7 @@ case class SoftLfsr(poly: Int, start: Int = 1) {
     var b = state & poly
     b = parity(b)
     state = (state << 1) | b
-    state &= (1 << 17)-1
+    state &= (1 << 17) - 1
   }
 }
 
@@ -385,7 +457,7 @@ object SoftLfsr {
 }
 
 object TopLevelSimWithSalaeData {
-  def analyze(state: Int) : Seq[Option[Int]] = {
+  def analyze(state: Int): Seq[Option[Int]] = {
     val polys = Seq(0x00012BD0, 0x0001CF73)
 
     var offsets = mutable.ArrayBuffer[Option[Int]]()
@@ -419,72 +491,72 @@ object TopLevelSimWithSalaeData {
 
 
     SimConfig.allOptimisation
-            .addSimulatorFlag("-Wno-PINMISSING -I../../sim_rtl")
-            .withWave
-            .compile {
-      val top = new LighthouseTopLevel(uartBaudrate = 1 MHz,
-                                       useDdrDecoder = true,
-                                       frequency = 48 MHz)
+      .addSimulatorFlag("-Wno-PINMISSING -I../../sim_rtl")
+      .withWave
+      .compile {
+        val top = new LighthouseTopLevel(uartBaudrate = 1 MHz,
+          useDdrDecoder = true,
+          frequency = 48 MHz)
 
-      top.clkCtrl.coreClockDomain.clock.simPublic() // To clock the design
-      top.slowArea.beamsStream.valid.simPublic() // To read the beams before the UART
-      top.slowArea.beamsStream.payload.simPublic() // To read the beams before the UART
-      top.slowArea.beamsStream.ready.simPublic() // To read the beams before the UART
-
-
-      top
-    }.doSim{ dut =>
-
-      dut.clkCtrl.coreClockDomain.forkStimulus(10)
-
-      var signalThread = fork {
-        var currentTime = TimeNumber(0)
-        var sampleTime = TimeNumber(-1)
-        val clockHalfPeriod = dut.clkCtrl.coreClockDomain.frequency.getValue.toTime / 2
-
-        while (currentTime.toBigDecimal < (500 ms).toBigDecimal) {
-          val sample = sampleReader.readNext()
-          if (sample.isEmpty) {
-            println("Empty sample?!")
-            return
-          }
-          sampleTime = TimeNumber(BigDecimal(sample.get(0)))
-
-          if (true || sampleTime.toBigDecimal >= currentTime.toBigDecimal) {
-
-            val waitEdge = ((sampleTime.toBigDecimal - currentTime.toBigDecimal) / clockHalfPeriod.toBigDecimal).toInt
-            // println(waitEdge)
-            if (waitEdge > 0) {
-              // dut.clkCtrl.coreClockDomain.waitEdge(waitEdgbeamWorde)
-              // currentTime += clockHalfPeriod * waitEdge
+        top.clkCtrl.coreClockDomain.clock.simPublic() // To clock the design
+        top.slowArea.beamsStream.valid.simPublic() // To read the beams before the UART
+        top.slowArea.beamsStream.payload.simPublic() // To read the beams before the UART
+        top.slowArea.beamsStream.ready.simPublic() // To read the beams before the UART
 
 
-              if (waitEdge > 10000) {
-                for (i <- 0 to 10000) {
-                  dut.io.d(0) #= d
-                  dut.io.e(0) #= e
-                  dut.clkCtrl.coreClockDomain.waitEdge(1)
-                }
-                currentTime = sampleTime
-              } else {
-                for (i <- 0 to waitEdge-1) {
-                  dut.io.d(0) #= d
-                  dut.io.e(0) #= e
-                  dut.clkCtrl.coreClockDomain.waitEdge(1)
-                }
-                currentTime += clockHalfPeriod * waitEdge
-              }
+        top
+      }.doSim { dut =>
+
+        dut.clkCtrl.coreClockDomain.forkStimulus(10)
+
+        var signalThread = fork {
+          var currentTime = TimeNumber(0)
+          var sampleTime = TimeNumber(-1)
+          val clockHalfPeriod = dut.clkCtrl.coreClockDomain.frequency.getValue.toTime / 2
+
+          while (currentTime.toBigDecimal < (500 ms).toBigDecimal) {
+            val sample = sampleReader.readNext()
+            if (sample.isEmpty) {
+              println("Empty sample?!")
+              return
             }
+            sampleTime = TimeNumber(BigDecimal(sample.get(0)))
 
-            d = if(sample.get(1).stripPrefix(" ").toInt == 0) false else true
-            e = if(sample.get(2).stripPrefix(" ").toInt == 0) false else true
+            if (true || sampleTime.toBigDecimal >= currentTime.toBigDecimal) {
+
+              val waitEdge = ((sampleTime.toBigDecimal - currentTime.toBigDecimal) / clockHalfPeriod.toBigDecimal).toInt
+              // println(waitEdge)
+              if (waitEdge > 0) {
+                // dut.clkCtrl.coreClockDomain.waitEdge(waitEdgbeamWorde)
+                // currentTime += clockHalfPeriod * waitEdge
+
+
+                if (waitEdge > 10000) {
+                  for (i <- 0 to 10000) {
+                    dut.io.d(0) #= d
+                    dut.io.e(0) #= e
+                    dut.clkCtrl.coreClockDomain.waitEdge(1)
+                  }
+                  currentTime = sampleTime
+                } else {
+                  for (i <- 0 to waitEdge - 1) {
+                    dut.io.d(0) #= d
+                    dut.io.e(0) #= e
+                    dut.clkCtrl.coreClockDomain.waitEdge(1)
+                  }
+                  currentTime += clockHalfPeriod * waitEdge
+                }
+              }
+
+              d = if (sample.get(1).stripPrefix(" ").toInt == 0) false else true
+              e = if (sample.get(2).stripPrefix(" ").toInt == 0) false else true
+            }
           }
         }
+
+        signalThread.join()
+
+        simSuccess()
       }
-
-      signalThread.join()
-
-      simSuccess()
-    }
   }
 }
